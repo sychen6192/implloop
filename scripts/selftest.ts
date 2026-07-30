@@ -304,26 +304,24 @@ function tmpdir(): string {
 
 // ---------- runner invocation ----------
 {
-  const inline = buildInvocation("impl-writer", "", "short prompt", {
-    jsonEvents: true,
-    skipPerms: false,
-    platform: "linux",
-  });
-  check("runner: inline args on posix", inline.args.includes("short prompt") && !inline.promptFile);
-  check("runner: no --model when empty", !inline.args.includes("--model"));
+  // Flags only: the prompt goes to the child's stdin, so it must never reach argv — that is
+  // what keeps cmd.exe from re-parsing it and puts the 8191-char limit out of reach.
+  const bare = buildInvocation("impl-writer", "", { jsonEvents: true, skipPerms: false });
+  check(
+    "runner: argv is flags only, no positional prompt",
+    JSON.stringify(bare) === JSON.stringify(["run", "--agent", "impl-writer", "--format", "json"]),
+    JSON.stringify(bare),
+  );
+  check("runner: no --model when empty", !bare.includes("--model"));
+  check("runner: no --file", !bare.includes("--file"));
 
-  let written = "";
-  const huge = buildInvocation("impl-writer", "m", "x".repeat(40_000), {
-    jsonEvents: true,
-    skipPerms: false,
-    platform: "win32",
-    writeFile: (text) => {
-      written = text;
-      return "/tmp/fake-prompt.md";
-    },
-  });
-  check("runner: oversized prompt falls back to --file", huge.args.includes("--file"));
-  check("runner: prompt written to file", written.length === 40_000);
+  const full = buildInvocation("impl-writer", "m", { jsonEvents: false, skipPerms: true });
+  check(
+    "runner: model and skip-perms passed, --format dropped",
+    full.includes("--model") && full.includes("m") &&
+      full.includes("--dangerously-skip-permissions") && !full.includes("--format"),
+    JSON.stringify(full),
+  );
 }
 
 // ---------- git helpers ----------
