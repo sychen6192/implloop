@@ -24,6 +24,8 @@ const { slugify } = await import("../libs/git");
 const { detectBlocked, buildStepPrompt, buildReviewPrompt, REVIEW_DIFF_MAX_CHARS } =
   await import("../prompts");
 const { buildInvocation } = await import("../runners/opencode");
+const { planKill, killTree } = await import("../libs/shell");
+const { spawn: spawnChild } = await import("node:child_process");
 
 let passed = 0;
 let failed = 0;
@@ -329,6 +331,67 @@ function tmpdir(): string {
   check("git: slugify basic", slugify("Add Rate-Limit.md") === "add-rate-limit");
   check("git: slugify empty fallback", slugify("!!!.md") === "task");
   check("git: slugify caps length", slugify(`${"a".repeat(80)}.md`).length <= 40);
+}
+
+// ---------- 逾時終止整棵程序樹 ----------
+{
+  // Windows 沒有 signal，Node 一律翻成 TerminateProcess，所以只有 taskkill 打得到整棵樹，
+  // 也沒有「先溫和再強制」可言。
+  const win = planKill(4242, "SIGTERM", "win32");
+  check(
+    "planKill（win32）：taskkill /T /F",
+    win.via === "taskkill" && win.args.join(" ") === "/pid 4242 /T /F",
+    JSON.stringify(win),
+  );
+  check(
+    "planKill（win32）：SIGKILL 與 SIGTERM 同一計畫",
+    JSON.stringify(planKill(4242, "SIGKILL", "win32")) === JSON.stringify(win),
+  );
+
+  const posixTerm = planKill(4242, "SIGTERM", "linux");
+  check(
+    "planKill（linux）：送 process group（負 pid）而非單一程序",
+    posixTerm.via === "signal" && posixTerm.target === -4242 && posixTerm.signal === "SIGTERM",
+    JSON.stringify(posixTerm),
+  );
+  const posixKill = planKill(4242, "SIGKILL", "linux");
+  check(
+    "planKill（linux）：保留 SIGKILL 升級",
+    posixKill.via === "signal" && posixKill.signal === "SIGKILL",
+  );
+
+  // 迴歸本體：外層程序 + 更長命的子程序，正是 Windows 上 cmd.exe + opencode 的形狀。
+  if (process.platform !== "win32") {
+    const wrapper = spawnChild("sh", ["-c", "sleep 30 & echo $!; wait"], {
+      stdio: ["ignore", "pipe", "ignore"],
+      detached: true, // runner 現在的做法；group signal 依賴它
+    });
+    const grandchild = await new Promise<number>((res) => {
+      wrapper.stdout.setEncoding("utf8");
+      wrapper.stdout.once("data", (d: string) => res(Number(d.trim())));
+    });
+    const alive = (pid: number) => {
+      try {
+        process.kill(pid, 0);
+        return true;
+      } catch {
+        return false;
+      }
+    };
+    check("killTree 前置：孫程序確實活著", alive(grandchild), `pid ${grandchild}`);
+    killTree(wrapper, "SIGKILL");
+    await new Promise((r) => setTimeout(r, 300));
+    check("killTree：孫程序一起收掉（舊 child.kill 只殺外層）", !alive(grandchild), `pid ${grandchild}`);
+    check("killTree：外層也結束", wrapper.exitCode !== null || wrapper.signalCode !== null);
+    check("killTree：對已結束的程序再呼叫不丟例外", (() => {
+      try {
+        killTree(wrapper, "SIGKILL");
+        return true;
+      } catch {
+        return false;
+      }
+    })());
+  }
 }
 
 console.log(`\nselftest：${passed} passed, ${failed} failed`);
