@@ -34,6 +34,8 @@ implloop <task.md>        （於目標 repo 根執行）
 ## 前置需求
 
 - Node.js 20+；opencode CLI（版本需支援 `--format json`）；LLM provider 存取權。
+- ripgrep（`rg`）。opencode 的 glob 與 grep 都由它實作，planner 與 writer 探索 repo 時
+  必用；缺了會讓兩個工具一律回 `[error]`。見 Troubleshooting 最後一項。
 - 目標 repo 是 git repo，且有可跑的測試指令（自動偵測 maven / gradle / npm test /
   pytest，或以 `IL_BUILD_CMD` / `IL_TEST_CMD` 指定）。
 
@@ -115,6 +117,14 @@ build log、失敗報告、review 判決。結果怪的時候從這裡查起。
 - **exit 4 很常見。** 這不是故障——代表 task 檔寫得太模糊（planner 提問）或規格
   自相矛盾（writer BLOCKED）。把 task 檔的驗收條件寫具體，成功率會直接上升。
 - **看不到即時進度。** opencode 版本太舊，設 `IL_OPENCODE_JSON=0` 退回整段輸出。
+- **trace 裡 glob 與 grep 一律 `[error]`。** 缺 ripgrep。opencode 的找法是 PATH 上的
+  `rg`（Windows 為 `rg.exe`）→ 家目錄下的 `.cache/opencode/bin/`（Windows 也走這個
+  XDG 路徑，即 `%USERPROFILE%\.cache\opencode\bin\rg.exe`）→ 從 GitHub Releases 下載。
+  封閉網路第三步必失敗，所以要讓前兩步之一命中：裝套件（`winget install
+  BurntSushi.ripgrep.MSVC` / `brew install ripgrep` / `apt install ripgrep`），或直接
+  複製 VS Code 自帶的那份到上述 cache 目錄（在
+  `<VS Code>\resources\app\node_modules\@vscode\ripgrep\bin\rg.exe`）。
+  驗證：`opencode debug rg files --glob "**/*" --limit 5`。
 
 ## Development
 
