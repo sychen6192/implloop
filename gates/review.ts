@@ -2,7 +2,7 @@
 // must-read enforcement (a verdict with zero tool calls = fabricated; observed in testgen).
 // Pass = blockers empty AND no requirement judged missing/misunderstood.
 import {
-  AgentRunner,
+  AgentRunOutput,
   REQ_VERDICTS,
   RequirementJudgement,
   ReqVerdict,
@@ -74,11 +74,9 @@ export function zeroToolCallVerdict(raw: string): ReviewVerdict {
   };
 }
 
-export async function runReviewGate(
-  runner: AgentRunner,
-  prompt: string,
-): Promise<ReviewVerdict> {
-  const out = await runner.run("reviewer", prompt);
+// Judges an already-run reviewer session. The session itself is executed by the
+// orchestrator's budgeted session() so budget accounting has exactly one owner.
+export function runReviewGate(out: Pick<AgentRunOutput, "text" | "toolCallCount">): ReviewVerdict {
   if (REVIEWER_MUST_READ && out.toolCallCount === 0) return zeroToolCallVerdict(out.text);
   return parseVerdict(out.text);
 }

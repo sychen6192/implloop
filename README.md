@@ -26,10 +26,18 @@ implloop <task.md>        （於目標 repo 根執行）
 迭代迴圈正是誘發模型作弊的環境（多次失敗後開始硬編碼期望值、改測試）。implloop 的
 對策全部在 exit-code 層：
 
-- Phase T 凍結的驗收測試檔，之後任何 diff 碰到就整輪還原（`git diff` 檢查）。
+- Phase T 產出的**全部**檔案凍結（不只路徑像測試的），之後任何 diff 碰到就整輪還原。
+- 建置/測試設定檔（package.json、pom.xml、pytest.ini、jest.config 等）與
+  `.opencode/`（agent 權限定義）在**每個 phase** 都是保護路徑——改測試指令、
+  加 excludes、給自己開 bash 權限，全部在 exit-code 層擋掉。步驟真的需要加依賴時，
+  writer 應回報 BLOCKED 交還人類。
 - 新增行掃 hack markers（skip/@Disabled/xfail/exit(0)），命中同樣還原。
 - 誠實的門：writer 可回報 `BLOCKED: <理由>`（規格與測試矛盾、缺外部資訊），
   pipeline 以 exit 4 交還人類——堵死所有路只會逼弱模型作弊。
+
+多步驟計畫的收斂規則：test-first 凍結的驗收測試在功能完成前必然是紅的，所以
+**中間步驟容忍測試紅燈**（仍要求可編譯、protect 乾淨），**最後一步與 review 修正
+要求全綠**。沒有 test-first 時每一步都要求全綠。
 
 ## 前置需求
 
@@ -45,7 +53,7 @@ implloop <task.md>        （於目標 repo 根執行）
 git clone <repo> implloop && cd implloop
 npm install
 npm run setup      # 安裝 impl-planner / impl-writer / impl-reviewer 到 ~/.config/opencode/
-npm run check      # typecheck + 72 個離線測試
+npm run check      # typecheck + 離線 selftest（數量以輸出為準）
 ```
 
 選用：把 wrapper 加入 PATH，之後在任何目錄都能用 `implloop`。
@@ -73,7 +81,8 @@ task 檔就是一份 markdown：描述需求與驗收條件，寫得越可驗證
 起手挑小而明確的任務（一個 endpoint、一個 bugfix）。
 
 退出碼：`0` 全過（branch 可直接開 PR）｜`2` 停損（已完成步驟保留在 branch 上）｜
-`4` 規格不清或 BLOCKED（需要人回答）｜`1` 致命錯誤。
+`3` 環境故障（agent CLI 起不來，非模型問題）｜`4` 規格不清或 BLOCKED（需要人回答）｜
+`1` 致命錯誤。
 
 每輪產物寫入 `<clone>/runs/<repo 名>/<時間戳>/`：每個 phase 的 prompt、模型原文、
 build log、失敗報告、review 判決。結果怪的時候從這裡查起。
@@ -92,12 +101,19 @@ build log、失敗報告、review 判決。結果怪的時候從這裡查起。
 | `IL_TEST_FIRST` | 1 | 0 = 跳過 Phase T（不建議：防作弊主力） |
 | `IL_BUILD_CMD` / `IL_TEST_CMD` | 自動偵測 | 建置/測試指令覆蓋 |
 | `IL_PROTECT` | - | 額外保護 glob（逗號分隔） |
-| `IL_REVIEW_ROUNDS` | 2 | review 修正回合上限 |
+| `IL_REVIEW_ROUNDS` | 2 | review 回合上限（修正回合 = 值 − 1） |
 | `IL_SKIP_REVIEW` | - | 1 = 跳過 review gate |
 | `IL_REVIEWER_MUST_READ` | 1 | 0 = 允許 reviewer 沒讀檔就給判決（不建議） |
 | `IL_AGENT_TIMEOUT_MS` | 1500000 | 單 session 逾時（25 分鐘，dense 27B 實測值） |
 | `IL_BRANCH_PREFIX` | implloop/ | run branch 前綴 |
 | `IL_SKIP_BASELINE` | - | 1 = 跳過起點 baseline 測試（不建議） |
+| `IL_GATE_TIMEOUT_MS` | 900000 | 單次 build/test gate 逾時；逾時終止整棵程序樹 |
+| `IL_RUNS_DIR` | 工具 clone 內 | artifacts 落點覆蓋（共用或唯讀安裝時使用） |
+| `IL_OPENCODE_BIN` | opencode | opencode 執行檔路徑覆蓋 |
+| `IL_QUIET` | - | 1 = 關閉 verbose 行 |
+
+數值型變數在啟動時驗證，拼錯直接 FATAL 並點名變數。Ctrl-C 中斷時會終止 agent
+程序樹並 rollback 未 commit 的改動（已 commit 的 checkpoint 保留在 branch 上）。
 
 ## Troubleshooting
 

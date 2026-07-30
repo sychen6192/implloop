@@ -3,9 +3,10 @@
 // retry.checks pattern; testgen principle 2).
 import * as fs from "node:fs";
 import * as path from "node:path";
-import { spawnSync } from "node:child_process";
+import { spawn } from "node:child_process";
 import { GateResult } from "../libs/types";
 import { buildFailureReport } from "../libs/feedback";
+import { DETACH_CHILDREN, killTree, trackForShutdown } from "../libs/shell";
 import { BUILD_CMD, TEST_CMD, GATE_TIMEOUT_MS, REPO_ROOT } from "../config";
 
 export interface BuildConfig {
@@ -16,7 +17,13 @@ export interface BuildConfig {
 
 export function detectBuildConfig(repoRoot: string = REPO_ROOT): BuildConfig | null {
   if (BUILD_CMD || TEST_CMD) {
-    return { kind: "custom", buildCmd: BUILD_CMD, testCmd: TEST_CMD || BUILD_CMD };
+    if (!TEST_CMD) {
+      // A build command alone would silently become the test command too, removing the
+      // test gate entirely — the one gate the whole design leans on.
+      console.error("FATAL: IL_BUILD_CMD 已設定但缺 IL_TEST_CMD——test gate 不能沒有測試指令");
+      process.exit(1);
+    }
+    return { kind: "custom", buildCmd: BUILD_CMD, testCmd: TEST_CMD };
   }
   const has = (f: string) => fs.existsSync(path.join(repoRoot, f));
   if (has("pom.xml")) {
@@ -27,7 +34,12 @@ export function detectBuildConfig(repoRoot: string = REPO_ROOT): BuildConfig | n
     return { kind: "gradle", buildCmd: `${wrapper} classes`, testCmd: `${wrapper} test` };
   }
   if (has("package.json")) {
-    const pkg = JSON.parse(fs.readFileSync(path.join(repoRoot, "package.json"), "utf8"));
+    let pkg: { scripts?: Record<string, string> };
+    try {
+      pkg = JSON.parse(fs.readFileSync(path.join(repoRoot, "package.json"), "utf8"));
+    } catch {
+      return null; // malformed package.json = undetectable, same as no build file
+    }
     const scripts = (pkg.scripts ?? {}) as Record<string, string>;
     const buildCmd = scripts.build ? "npm run build" : "";
     const testCmd = scripts.test ? "npm test" : "";
@@ -48,22 +60,42 @@ export interface CommandOutcome {
 
 // Commands come from config/detection (operator-owned, never model-owned), so a shell is
 // acceptable here and needed for things like "./gradlew test".
-export function runCommand(cmd: string, cwd: string = REPO_ROOT): CommandOutcome {
-  const r = spawnSync(cmd, {
-    cwd,
-    shell: true,
-    encoding: "utf8",
-    timeout: GATE_TIMEOUT_MS,
-    maxBuffer: 64 * 1024 * 1024,
-    env: process.env,
+// Async spawn (not spawnSync) so a timeout can kill the whole process tree — spawnSync's
+// built-in timeout signals only the shell, and a mvn/gradle grandchild survives it.
+export function runCommand(cmd: string, cwd: string = REPO_ROOT): Promise<CommandOutcome> {
+  return new Promise((resolve) => {
+    const child = spawn(cmd, {
+      cwd,
+      shell: true,
+      env: process.env,
+      detached: DETACH_CHILDREN,
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+    trackForShutdown(child);
+
+    let out = "";
+    child.stdout.setEncoding("utf8");
+    child.stderr.setEncoding("utf8");
+    child.stdout.on("data", (c: string) => (out += c));
+    child.stderr.on("data", (c: string) => (out += c));
+
+    let timedOut = false;
+    const timer = setTimeout(() => {
+      timedOut = true;
+      killTree(child, "SIGKILL");
+    }, GATE_TIMEOUT_MS);
+
+    let spawnErr: string | undefined;
+    child.on("error", (e) => (spawnErr = e.message));
+    child.on("close", (code) => {
+      clearTimeout(timer);
+      resolve({
+        ok: code === 0 && !spawnErr && !timedOut,
+        output: spawnErr && !out.trim() ? spawnErr : out.trim(),
+        timedOut,
+      });
+    });
   });
-  const timedOut = r.error?.name === "Error" && /ETIMEDOUT/.test(String(r.error.message ?? ""));
-  const output = [r.stdout ?? "", r.stderr ?? ""].join("\n").trim();
-  return {
-    ok: r.status === 0 && !r.error,
-    output: r.error && !output ? String(r.error.message) : output,
-    timedOut: timedOut || (r.signal === "SIGTERM" && r.status === null),
-  };
 }
 
 // A red test run caused by code that doesn't COMPILE must not satisfy the fail-to-pass
@@ -75,9 +107,9 @@ export function looksLikeCompileFailure(raw: string): boolean {
   return COMPILE_FAILURE.test(raw);
 }
 
-export function runBuildGate(cfg: BuildConfig): GateResult {
+export async function runBuildGate(cfg: BuildConfig): Promise<GateResult> {
   if (!cfg.buildCmd) return { passed: true, report: "（無獨立 build 步驟，直接進測試）" };
-  const r = runCommand(cfg.buildCmd);
+  const r = await runCommand(cfg.buildCmd);
   if (r.ok) return { passed: true, report: "build OK", raw: r.output };
   return {
     passed: false,
@@ -89,8 +121,8 @@ export function runBuildGate(cfg: BuildConfig): GateResult {
   };
 }
 
-export function runTestGate(cfg: BuildConfig): GateResult {
-  const r = runCommand(cfg.testCmd);
+export async function runTestGate(cfg: BuildConfig): Promise<GateResult> {
+  const r = await runCommand(cfg.testCmd);
   if (r.ok) return { passed: true, report: "tests OK", raw: r.output };
   return {
     passed: false,

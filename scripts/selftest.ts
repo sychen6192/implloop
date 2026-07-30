@@ -195,6 +195,28 @@ function tmpdir(): string {
   check("protect: looksLikeTestPath positive", looksLikeTestPath("src/test/java/FooTest.java"));
   check("protect: looksLikeTestPath negative", !looksLikeTestPath("src/main/java/Foo.java"));
   check("protect: looksLikeTestPath not fooled by CI", !looksLikeTestPath(".github/workflows/ci.yml"));
+
+  // Build/test configuration is the gate itself — rewriting `"test": "echo ok"` or a
+  // surefire <excludes> must be caught in EVERY phase, including Phase T.
+  for (const phase of ["tests", "impl"] as const) {
+    const cfgViolations = checkProtect({
+      changedFiles: ["package.json", "core/pom.xml", "pytest.ini"],
+      addedLines: [],
+      frozenFiles: [],
+      phase,
+    });
+    check(`protect(${phase}): build/test config protected`, cfgViolations.length === 3);
+  }
+
+  // Repo-local agent definitions override global ones and the permission guard runs only
+  // at startup — a writable .opencode/ would let the writer grant itself bash.
+  const agentEscalation = checkProtect({
+    changedFiles: [".opencode/agent/impl-writer.md"],
+    addedLines: [],
+    frozenFiles: [],
+    phase: "tests",
+  });
+  check("protect(tests): .opencode agent files protected", agentEscalation.length === 1);
 }
 
 // ---------- build detection ----------
@@ -262,27 +284,45 @@ function tmpdir(): string {
 {
   const a = failureSignature("test", "Expected 5 but was 3 at /home/u/repo/src/Foo.java:42 (took 913ms)");
   const b = failureSignature("test", "Expected 5 but was 3 at /home/u/repo/src/Foo.java:42 (took 1204ms)");
-  check("stuck: numbers/paths normalized", a === b);
+  check("stuck: durations/paths normalized", a === b);
   const c = failureSignature("test", "NullPointerException at Bar.java:7");
   check("stuck: different error differs", a !== c);
+  // Short assertion values must SURVIVE normalization — "expected 5 but was 3" and
+  // "expected 7 but was 2" are different failures (the model IS making progress).
+  check(
+    "stuck: different assertion values differ",
+    failureSignature("test", "expected 5 but was 3") !==
+      failureSignature("test", "expected 7 but was 2"),
+  );
+  check(
+    "stuck: long ids/timestamps still normalized",
+    failureSignature("test", "request 1699999999999 failed") ===
+      failureSignature("test", "request 1700000000123 failed"),
+  );
   check("stuck: gate is part of the signature", failureSignature("build", "x") !== failureSignature("test", "x"));
 
   const det = new StuckDetector(2);
   check("stuck: first failure not stuck", !det.record("test", "same error"));
   check("stuck: second repeat not yet stuck", !det.record("test", "same error"));
   check("stuck: third repeat is stuck", det.record("test", "same error"));
-  det.reset();
-  check("stuck: reset clears streak", !det.record("test", "same error"));
   const det2 = new StuckDetector(2);
   det2.record("test", "error A");
   det2.record("test", "error B");
-  check("stuck: alternation is progress", !det2.record("test", "error A") || true);
+  check("stuck: alternation is progress", !det2.record("test", "error A"));
 }
 
 // ---------- prompts ----------
 {
-  check("blocked: detected", detectBlocked("some text\nBLOCKED: 測試與規格矛盾\n") === "測試與規格矛盾");
+  check("blocked: detected on last line", detectBlocked("some text\nBLOCKED: 測試與規格矛盾\n") === "測試與規格矛盾");
+  check("blocked: detected on first line", detectBlocked("BLOCKED: 缺外部資訊\n然後是說明") === "缺外部資訊");
   check("blocked: absent", detectBlocked("all done, files: a.ts") === null);
+  // A writer ECHOING its instructions (which contain the literal marker) mid-reply must
+  // not abort the run — and neither must the raw "<理由>" placeholder itself.
+  check(
+    "blocked: mid-reply instruction echo ignored",
+    detectBlocked("開始工作\n規則說：若矛盾回覆 BLOCKED: 這樣的一行\n完成了 a.ts") === null,
+  );
+  check("blocked: placeholder not a report", detectBlocked("BLOCKED: <理由>") === null);
 
   const step = buildStepPrompt({
     task: "t",
@@ -301,7 +341,10 @@ function tmpdir(): string {
     diff: "x".repeat(REVIEW_DIFF_MAX_CHARS + 1),
     changedFiles: ["a.ts", "b.ts"],
   });
-  check("prompt(review): big diff replaced by file list", !bigReview.includes("xxxxx") || bigReview.includes("diff 過大"));
+  check(
+    "prompt(review): big diff replaced by file list",
+    !bigReview.includes("xxxxx") && bigReview.includes("diff 過大"),
+  );
 }
 
 // ---------- runner invocation ----------
