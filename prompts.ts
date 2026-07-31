@@ -8,9 +8,17 @@ export const BLOCKED_PREFIX = "BLOCKED:";
 
 // Detect the writer's honest escape hatch (PROPOSAL §5.1: an explicit conflict-report
 // channel measurably reduces gate gaming).
+// Only the first and last non-empty lines are checked: models put verdicts at the reply's
+// edges, while a writer merely ECHOING its instructions (which contain the literal
+// "BLOCKED: <理由>") produces a mid-reply match that must not abort the run.
 export function detectBlocked(text: string): string | null {
-  const m = text.match(/^\s*BLOCKED:\s*(.+)$/m);
-  return m ? m[1].trim() : null;
+  const lines = text.split("\n").filter((l) => l.trim());
+  const edges = lines.length <= 1 ? lines : [lines[0], lines[lines.length - 1]];
+  for (const line of edges) {
+    const m = line.match(/^\s*BLOCKED:\s*(.+)$/);
+    if (m && !m[1].includes("<理由>")) return m[1].trim();
+  }
+  return null;
 }
 
 export function buildPlanPrompt(task: string, fixNote?: string): string {
@@ -90,11 +98,21 @@ ${frozen}${feedback}
 完成後以清單列出你建立/修改的檔案，並各附一句修改摘要。`;
 }
 
-export function buildReviewFixPrompt(task: string, blockers: string[], frozenFiles: readonly string[]): string {
+export function buildReviewFixPrompt(
+  task: string,
+  blockers: string[],
+  frozenFiles: readonly string[],
+  feedback?: string,
+): string {
   const frozen =
     frozenFiles.length > 0
       ? `\n已凍結的驗收測試（絕對不可修改）：\n${frozenFiles.map((f) => `- ${f}`).join("\n")}\n`
       : "";
+  // Retries keep the blockers in view — a fix attempt that only sees the gate report
+  // is being told to fix problems it can no longer read.
+  const gate = feedback
+    ? `\n上一次修正未通過驗證，失敗報告：\n<gate_report>\n${feedback}\n</gate_report>\n`
+    : "";
   return `審查者對目前的實作提出了必須修正的問題。請逐一修正。
 
 <task>
@@ -103,7 +121,7 @@ ${task}
 
 Blockers（全部都要修）：
 ${blockers.map((b, i) => `${i + 1}. ${b}`).join("\n")}
-${frozen}
+${frozen}${gate}
 規則：
 - 只修 blockers 指出的問題，不要擴大改動範圍。
 - 不要執行任何建置或測試指令；不可修改測試。

@@ -1,56 +1,17 @@
-// Run a child process; stream stdout/stderr line-by-line (prefixed), return the full output.
-// Also owns Windows process spawning (planSpawn / explainSpawnError) for callers that spawn
-// without `shell: true` — the opencode runner and doctor.
+// Windows process spawning (planSpawn / explainSpawnError) and process-tree lifecycle
+// (killTree / trackForShutdown) shared by the opencode runner, the build/test gates, and
+// doctor.
 import { spawn, type ChildProcess } from "node:child_process";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { logVerbose } from "./log";
 
-export function shLive(
-  cmd: string,
-  args: string[],
-  linePrefix: string,
-  cwd: string,
-): Promise<{ code: number; out: string }> {
-  return new Promise((resolve) => {
-    logVerbose(`> 執行：${cmd} ${args.join(" ")}（cwd=${cwd}）`);
-    const child = spawn(cmd, args, {
-      cwd,
-      shell: process.platform === "win32",
-    });
-
-    let buf = "";
-    const pipe = (stream: NodeJS.ReadableStream) => {
-      let pending = "";
-      stream.setEncoding("utf8");
-      stream.on("data", (chunk: string) => {
-        buf += chunk;
-        pending += chunk;
-        const lines = pending.split("\n");
-        pending = lines.pop() ?? "";
-        for (const line of lines) {
-          if (line.trim()) logVerbose(`${linePrefix} ${line}`);
-        }
-      });
-    };
-    pipe(child.stdout);
-    pipe(child.stderr);
-
-    child.on("close", (code) => resolve({ code: code ?? 1, out: buf }));
-    child.on("error", (err) => {
-      logVerbose(`指令啟動失敗：${err.message}`);
-      resolve({ code: 1, out: String(err) });
-    });
-  });
-}
-
 // ─── Windows process spawning ────────────────────────────────────────────────
 //
-// shLive above passes `shell: true`, which makes the shell resolve the command — that is why
-// the build gate finds mvnw.cmd. Callers that must NOT go through a shell (the opencode
-// runner streams a JSONL event stream and passes a prompt containing shell metacharacters)
-// need this instead. Three distinct failures hide behind "spawn opencode failed", each
-// needing a different fix, and all three are invisible on Linux/macOS.
+// Callers that must NOT go through a shell (the opencode runner streams a JSONL event
+// stream and passes a prompt containing shell metacharacters) need this. Three distinct
+// failures hide behind "spawn opencode failed", each needing a different fix, and all
+// three are invisible on Linux/macOS.
 //
 // 1. ENOENT — an npm-installed CLI is `opencode.cmd` (plus `.ps1`, often an extensionless
 //    bash shim). Node's spawn does NOT apply PATHEXT, so a bare `opencode` is not found —
@@ -222,27 +183,48 @@ export function killTree(child: ChildProcess, signal: NodeJS.Signals = "SIGTERM"
 // tool would leave opencode running and holding the GPU. Windows needs none of this: children
 // are not detached there, and a console Ctrl-C already goes to every process on the console.
 const liveChildren = new Set<ChildProcess>();
+const shutdownHooks = new Set<() => void>();
 let shutdownHooked = false;
+
+// Extra synchronous cleanup on interrupt/exit (e.g. git reset so a Ctrl-C doesn't leave
+// the target repo littered with a half-written iteration). Returns an unregister fn.
+export function onShutdown(hook: () => void): () => void {
+  shutdownHooks.add(hook);
+  installShutdownHandlers();
+  return () => shutdownHooks.delete(hook);
+}
+
+function installShutdownHandlers(): void {
+  if (shutdownHooked) return;
+  shutdownHooked = true;
+
+  const cleanup = () => {
+    for (const c of liveChildren) killTree(c, "SIGKILL");
+    liveChildren.clear();
+    for (const hook of shutdownHooks) {
+      try {
+        hook();
+      } catch {
+        /* a failing hook must not block the remaining ones */
+      }
+    }
+    shutdownHooks.clear();
+  };
+  // 'exit' handlers must be synchronous; process.kill and execFileSync-based hooks are.
+  process.on("exit", cleanup);
+  for (const sig of ["SIGINT", "SIGTERM"] as const) {
+    process.on(sig, () => {
+      cleanup();
+      process.exit(sig === "SIGINT" ? 130 : 143);
+    });
+  }
+}
 
 /** Registers `child` so an interrupted run still takes its process tree down with it. */
 export function trackForShutdown(child: ChildProcess): void {
   liveChildren.add(child);
   child.once("exit", () => liveChildren.delete(child));
-  if (shutdownHooked) return;
-  shutdownHooked = true;
-
-  const killAll = () => {
-    for (const c of liveChildren) killTree(c, "SIGKILL");
-    liveChildren.clear();
-  };
-  // 'exit' handlers must be synchronous; process.kill is, so the POSIX path is safe here.
-  process.on("exit", killAll);
-  for (const sig of ["SIGINT", "SIGTERM"] as const) {
-    process.on(sig, () => {
-      killAll();
-      process.exit(sig === "SIGINT" ? 130 : 143);
-    });
-  }
+  installShutdownHandlers();
 }
 
 /** Turns a spawn errno into its actual cause, rather than guessing one cause for all of them. */

@@ -52,6 +52,7 @@ export interface OrchestratorConfig {
 interface Ctx extends OrchestratorConfig {
   sessionsUsed: number;
   frozenFiles: string[];
+  totalOutputTokens?: number;
 }
 
 function saveTo(dir: string) {
@@ -65,11 +66,15 @@ async function session(
   ctx: Ctx,
   role: "planner" | "writer" | "reviewer",
   prompt: string,
-): Promise<{ text: string; toolCallCount?: number } | null> {
+): Promise<{ text: string; status: string; toolCallCount?: number } | null> {
   if (ctx.sessionsUsed >= MAX_SESSIONS) return null;
   ctx.sessionsUsed += 1;
   log(`（session ${ctx.sessionsUsed}/${MAX_SESSIONS}）`);
-  return ctx.runner.run(role, prompt);
+  const out = await ctx.runner.run(role, prompt);
+  if (out.outputTokens !== undefined) {
+    ctx.totalOutputTokens = (ctx.totalOutputTokens ?? 0) + out.outputTokens;
+  }
+  return out;
 }
 
 function result(
@@ -84,6 +89,7 @@ function result(
     branch: ctx.branch,
     stepsCompleted: partial.stepsCompleted ?? 0,
     stepsTotal: partial.stepsTotal ?? 0,
+    totalOutputTokens: ctx.totalOutputTokens,
     ...partial,
   };
 }
@@ -101,6 +107,9 @@ async function phasePlan(
     save("prompt.md", prompt);
     const out = await session(ctx, "planner", prompt);
     if (!out) return { stop: result(ctx, { success: false, stopReason: "session-budget" }) };
+    if (out.status === "spawn-error") {
+      return { stop: result(ctx, { success: false, stopReason: "runner-error" }) };
+    }
     save("raw.txt", out.text);
 
     const outcome = parsePlan(out.text, REPO_ROOT);
@@ -136,6 +145,13 @@ async function phasePlan(
 
 // --- Shared gate chain (protect → build → test) ---
 
+// Test-gate modes. "tolerate-red" is what makes multi-step plans converge under
+// test-first: the frozen acceptance tests are red BY CONSTRUCTION until the last step,
+// so intermediate steps must not be judged on them. They still require a clean compile
+// (a red caused by non-compiling code is never acceptable) — full green is demanded at
+// the final step and at every review fix.
+export type TestGateMode = "expect-red" | "tolerate-red" | "require-green";
+
 interface GateChainOutcome {
   green: boolean;
   feedback?: string;
@@ -143,13 +159,15 @@ interface GateChainOutcome {
   raw?: string;
   // true = the working tree was reset (protect violation); writer starts over.
   wasReset?: boolean;
+  // tolerate-red only: tests are still failing (expected mid-plan); logged, not gating.
+  testsStillRed?: boolean;
 }
 
-function runGateChain(
+async function runGateChain(
   ctx: Ctx,
   phase: "tests" | "impl",
-  expectTestFailure: boolean,
-): GateChainOutcome {
+  mode: TestGateMode,
+): Promise<GateChainOutcome> {
   const violations = checkProtect({
     changedFiles: uncommittedFiles(),
     addedLines: uncommittedAddedLines(),
@@ -163,29 +181,34 @@ function runGateChain(
     return { green: false, feedback: report, gate: "protect", wasReset: true };
   }
 
-  const build = runBuildGate(ctx.buildCfg);
+  const build = await runBuildGate(ctx.buildCfg);
   if (!build.passed) {
     log("[FAIL] build gate");
     return { green: false, feedback: build.report, gate: "build", raw: build.raw };
   }
   log("[OK] build gate");
 
-  const test = runTestGate(ctx.buildCfg);
-  if (expectTestFailure) {
-    // Red because the test code doesn't compile is not a valid "failing test".
-    if (!test.passed && looksLikeCompileFailure(test.raw ?? "")) {
-      log("[FAIL] fail-to-pass gate：測試碼編譯失敗（不是合法的紅燈）");
-      return {
-        green: false,
-        gate: "test-compile",
-        feedback: buildFailureReport({
-          gate: "fail-to-pass gate",
-          raw: test.raw ?? "",
-          instruction: "測試必須「可編譯且執行後斷言失敗」；請先修正測試碼的編譯錯誤。",
-        }),
-        raw: test.raw,
-      };
-    }
+  const test = await runTestGate(ctx.buildCfg);
+
+  // Any mode: a red caused by code that doesn't compile is a hard failure.
+  if (!test.passed && looksLikeCompileFailure(test.raw ?? "")) {
+    log("[FAIL] test gate：編譯失敗");
+    return {
+      green: false,
+      gate: "test-compile",
+      feedback: buildFailureReport({
+        gate: mode === "expect-red" ? "fail-to-pass gate" : "test gate",
+        raw: test.raw ?? "",
+        instruction:
+          mode === "expect-red"
+            ? "測試必須「可編譯且執行後斷言失敗」；請先修正測試碼的編譯錯誤。"
+            : "程式碼必須先能編譯。請修正編譯錯誤。",
+      }),
+      raw: test.raw,
+    };
+  }
+
+  if (mode === "expect-red") {
     // Phase T: the new acceptance tests MUST fail (fail-to-pass verified by the loop).
     if (test.passed) {
       log("[FAIL] fail-to-pass gate：新測試沒有失敗");
@@ -202,6 +225,12 @@ function runGateChain(
     log("[OK] fail-to-pass gate：新測試如預期失敗");
     return { green: true };
   }
+
+  if (mode === "tolerate-red" && !test.passed) {
+    log("[OK] test gate：仍有紅燈（多步驟計畫進行中，預期；最後一步需全綠）");
+    return { green: true, testsStillRed: true, raw: test.raw };
+  }
+
   if (!test.passed) {
     log("[FAIL] test gate");
     return { green: false, feedback: test.report, gate: "test", raw: test.raw };
@@ -216,7 +245,7 @@ interface AttemptLoopInput {
   label: string;
   artifactPrefix: string;
   phase: "tests" | "impl";
-  expectTestFailure: boolean;
+  testMode: TestGateMode;
   buildPrompt: (feedback?: string) => string;
   commitMessage: string;
 }
@@ -225,6 +254,7 @@ type AttemptLoopOutcome =
   | { kind: "green"; changed: string[] }
   | { kind: "blocked"; reason: string }
   | { kind: "budget" }
+  | { kind: "runner-error" }
   | { kind: "stuck"; feedback: string }
   | { kind: "retries"; feedback: string };
 
@@ -241,6 +271,11 @@ async function writerAttempts(ctx: Ctx, input: AttemptLoopInput): Promise<Attemp
       resetHardClean();
       return { kind: "budget" };
     }
+    if (out.status === "spawn-error") {
+      // The agent never ran — burning retries on an environment failure helps nobody.
+      resetHardClean();
+      return { kind: "runner-error" };
+    }
     save("writer.md", out.text || "（writer 未回傳文字）");
     log(`[writer 總結] ${tail(out.text, 800)}`);
 
@@ -252,8 +287,8 @@ async function writerAttempts(ctx: Ctx, input: AttemptLoopInput): Promise<Attemp
     }
 
     const changedBefore = uncommittedFiles();
-    const chain = runGateChain(ctx, input.phase, input.expectTestFailure);
-    if (chain.raw) save(`${chain.gate}.log`, chain.raw);
+    const chain = await runGateChain(ctx, input.phase, input.testMode);
+    if (chain.raw) save(`${chain.gate ?? "test"}.log`, chain.raw);
     if (chain.green) {
       const changed = changedBefore;
       if (!commitAll(input.commitMessage)) {
@@ -304,18 +339,32 @@ export async function orchestrate(cfg: OrchestratorConfig): Promise<Orchestrator
       label: "驗收測試",
       artifactPrefix: "tests",
       phase: "tests",
-      expectTestFailure: true,
+      testMode: "expect-red",
       buildPrompt: () => buildTestFirstPrompt(ctx.task, plan.testPlan),
       commitMessage: "implloop: acceptance tests (red)",
     });
     if (outcome.kind === "green") {
-      ctx.frozenFiles = outcome.changed.filter(looksLikeTestPath);
-      log(`已凍結驗收測試 ${ctx.frozenFiles.length} 檔：`);
+      // Freeze EVERYTHING Phase T committed — acceptance tests at unconventional paths
+      // (spec/, tests/acceptance.py, helpers, fixtures) must be frozen too, or Phase I
+      // could rewrite them freely. looksLikeTestPath is reporting-only.
+      ctx.frozenFiles = outcome.changed;
+      const conventional = outcome.changed.filter(looksLikeTestPath).length;
+      log(`已凍結驗收測試階段的全部 ${ctx.frozenFiles.length} 檔（其中 ${conventional} 檔符合測試路徑慣例）：`);
       ctx.frozenFiles.forEach((f) => log(`  - ${f}`));
+      if (ctx.frozenFiles.length === 0) {
+        // Cannot happen when commitAll succeeded, but a run with zero frozen files has
+        // no anti-cheat protection at all — refuse to continue on that footing.
+        return fail({
+          stopReason: "stuck",
+          finalFeedback: "Phase T 通過但凍結清單為空，無法保證驗收測試不被改寫，中止。",
+        });
+      }
     } else if (outcome.kind === "blocked") {
       return fail({ stopReason: "blocked", blockedReason: outcome.reason });
     } else if (outcome.kind === "budget") {
       return fail({ stopReason: "session-budget" });
+    } else if (outcome.kind === "runner-error") {
+      return fail({ stopReason: "runner-error" });
     } else {
       return fail({ stopReason: outcome.kind === "stuck" ? "stuck" : "step-retries", finalFeedback: outcome.feedback });
     }
@@ -323,13 +372,19 @@ export async function orchestrate(cfg: OrchestratorConfig): Promise<Orchestrator
 
   // Phase I
   banner("Phase I：Implement（一步驟一 session）");
-  for (const step of plan.steps) {
+  for (const [idx, step] of plan.steps.entries()) {
     log(`── 步驟 ${step.id}/${stepsTotal}：${step.goal}`);
+    // Intermediate steps of a test-first plan tolerate red tests (the acceptance tests
+    // cannot pass until the feature is complete); the LAST step requires full green.
+    // Without test-first there are no expected-red tests, so every step requires green.
+    const isLast = idx === plan.steps.length - 1;
+    const testMode: TestGateMode =
+      TEST_FIRST && ctx.frozenFiles.length > 0 && !isLast ? "tolerate-red" : "require-green";
     const outcome = await writerAttempts(ctx, {
       label: `步驟 ${step.id}`,
       artifactPrefix: `step-${step.id}`,
       phase: "impl",
-      expectTestFailure: false,
+      testMode,
       buildPrompt: (feedback) =>
         buildStepPrompt({
           task: ctx.task,
@@ -349,14 +404,12 @@ export async function orchestrate(cfg: OrchestratorConfig): Promise<Orchestrator
       return fail({ stopReason: "blocked", blockedReason: outcome.reason });
     }
     if (outcome.kind === "budget") return fail({ stopReason: "session-budget" });
+    if (outcome.kind === "runner-error") return fail({ stopReason: "runner-error" });
     return fail({
       stopReason: outcome.kind === "stuck" ? "stuck" : "step-retries",
       finalFeedback: outcome.feedback,
     });
   }
-
-  // Phase T sanity: with test-first on, the frozen acceptance tests must now pass —
-  // already guaranteed by the last step's test gate (whole suite green).
 
   // Phase R
   if (SKIP_REVIEW) {
@@ -376,9 +429,10 @@ export async function orchestrate(cfg: OrchestratorConfig): Promise<Orchestrator
     const changedFiles = changedFilesSince(cfg.baseSha);
     const prompt = buildReviewPrompt({ task: ctx.task, diff, changedFiles });
     save("prompt.md", prompt);
-    if (ctx.sessionsUsed >= MAX_SESSIONS) return fail({ stopReason: "session-budget" });
-    ctx.sessionsUsed += 1;
-    const verdict = await runReviewGate(ctx.runner, prompt);
+    const out = await session(ctx, "reviewer", prompt);
+    if (!out) return fail({ stopReason: "session-budget" });
+    if (out.status === "spawn-error") return fail({ stopReason: "runner-error" });
+    const verdict = runReviewGate(out);
     lastVerdict = verdict;
     save("verdict.json", JSON.stringify(verdict, (k, v) => (k === "raw" ? undefined : v), 2));
     if (verdict.raw) save("review-raw.txt", verdict.raw);
@@ -401,24 +455,18 @@ export async function orchestrate(cfg: OrchestratorConfig): Promise<Orchestrator
       label: `review 修正（round ${round}）`,
       artifactPrefix: `review-${round}-fix`,
       phase: "impl",
-      expectTestFailure: false,
+      testMode: "require-green",
+      // Retries keep the blockers in view — earlier versions swapped to a step prompt on
+      // retry and the writer was told to fix blockers it could no longer read.
       buildPrompt: (feedback) =>
-        feedback
-          ? buildStepPrompt({
-              task: ctx.task,
-              step: { id: 0, goal: "修正 review blockers", files: [], verify: "" },
-              stepIndex: stepsTotal,
-              stepsTotal,
-              frozenFiles: ctx.frozenFiles,
-              feedback,
-            })
-          : buildReviewFixPrompt(ctx.task, verdict.blockers, ctx.frozenFiles),
+        buildReviewFixPrompt(ctx.task, verdict.blockers, ctx.frozenFiles, feedback),
       commitMessage: `implloop: review fixes (round ${round})`,
     });
     if (fixOutcome.kind === "blocked") {
       return fail({ stopReason: "blocked", blockedReason: fixOutcome.reason });
     }
     if (fixOutcome.kind === "budget") return fail({ stopReason: "session-budget" });
+    if (fixOutcome.kind === "runner-error") return fail({ stopReason: "runner-error" });
     if (fixOutcome.kind !== "green") {
       return fail({
         stopReason: fixOutcome.kind === "stuck" ? "stuck" : "step-retries",

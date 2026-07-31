@@ -1,12 +1,16 @@
 // Stuck detection: a repeated failure signature means the loop is adding no information.
-// Signature = gate + normalized error text (digits, paths, durations stripped), so
-// "same failure, different timestamp" still counts as a repeat.
+// Signature = gate + normalized error text, so "same failure, different timestamp" still
+// counts as a repeat. Only LONG digit runs (>=4: timestamps, addresses, ids, durations)
+// are stripped — short numbers stay, because `expected 5 but was 3` and `expected 7 but
+// was 2` are DIFFERENT failures and collapsing them stops the loop prematurely on exactly
+// the assertion-failure class where models need the most attempts.
 import { createHash } from "node:crypto";
 
 export function failureSignature(gate: string, report: string): string {
   const normalized = report
     .toLowerCase()
-    .replace(/\d+/g, "#")
+    .replace(/\d+(\.\d+)?\s*(ms|s|secs?|seconds?)\b/g, "#dur") // durations
+    .replace(/\d{4,}/g, "#") // timestamps, addresses, ids
     .replace(/[a-z]?:?[\\/][^\s:,)]+/g, "<path>") // absolute/relative paths
     .replace(/\s+/g, " ")
     .trim()
@@ -31,11 +35,5 @@ export class StuckDetector {
       this.repeats = 0;
     }
     return this.repeats >= this.limit;
-  }
-
-  // A green gate (or a new step) resets the streak.
-  reset() {
-    this.last = "";
-    this.repeats = 0;
   }
 }

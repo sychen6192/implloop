@@ -3,11 +3,13 @@
 // path — frozen test files, test-looking paths, CI config — is rejected at exit-code level
 // (ImpossibleBench: read-only tests push cheating to near zero). Added lines are also
 // scanned for hack markers (skip/xfail/@Disabled/exit(0)).
-import * as path from "node:path";
 import { EXTRA_PROTECT_GLOBS } from "../config";
 
-// Built-in protected patterns: test trees, test-file conventions, CI config.
-export const BUILTIN_PROTECT_GLOBS: readonly string[] = [
+// Named glob groups (composed into BUILTIN_PROTECT_GLOBS below). Named because they have
+// different lifecycles: TEST_GLOBS also drive the freeze heuristic, CI/CONFIG/AGENT globs
+// are protected in EVERY phase — including Phase T, where the writer is allowed to create
+// tests but must not touch how they are run.
+export const TEST_GLOBS: readonly string[] = [
   "**/src/test/**",
   "**/*.test.*",
   "**/*.spec.*",
@@ -16,9 +18,50 @@ export const BUILTIN_PROTECT_GLOBS: readonly string[] = [
   "**/*_test.py",
   "**/*_test.go",
   "**/conftest.py",
+];
+
+export const CI_GLOBS: readonly string[] = [
   ".github/workflows/**",
   "azure-pipelines*.yml",
   "Jenkinsfile",
+];
+
+// Build/test configuration: rewriting `"test": "echo ok"`, adding a surefire <excludes>,
+// or pointing pytest away from the acceptance tests bypasses the entire test gate. The
+// test command string is captured once at startup and resolved at run time, so these
+// files ARE the gate. Dependency changes are the human's job — the writer reports
+// BLOCKED when a step genuinely needs one.
+export const BUILD_CONFIG_GLOBS: readonly string[] = [
+  "package.json",
+  "**/package.json",
+  "pom.xml",
+  "**/pom.xml",
+  "build.gradle",
+  "build.gradle.kts",
+  "**/build.gradle",
+  "**/build.gradle.kts",
+  "gradle.properties",
+  "settings.gradle*",
+  ".mvn/**",
+  "pytest.ini",
+  "pyproject.toml",
+  "tox.ini",
+  "setup.cfg",
+  "jest.config.*",
+  "vitest.config.*",
+  "Makefile",
+];
+
+// Agent definitions: a repo-local .opencode/agent/impl-writer.md overrides the global one
+// and the permission guard runs only once at startup — writable agent files would let the
+// writer grant itself bash for every subsequent session.
+export const AGENT_GLOBS: readonly string[] = [".opencode/**"];
+
+export const BUILTIN_PROTECT_GLOBS: readonly string[] = [
+  ...TEST_GLOBS,
+  ...CI_GLOBS,
+  ...BUILD_CONFIG_GLOBS,
+  ...AGENT_GLOBS,
 ];
 
 // Minimal glob→regex: ** = any depth, * = within one segment. Enough for the patterns
@@ -67,19 +110,19 @@ export interface ProtectViolation {
   detail: string;
 }
 
-// CI config stays protected in every phase; test paths only once tests are frozen.
-const CI_GLOBS = BUILTIN_PROTECT_GLOBS.slice(8);
-
 export function checkProtect(input: {
   changedFiles: string[];
   addedLines: string[];
   frozenFiles: readonly string[];
-  // "tests" = Phase T (the writer is SUPPOSED to create test files; only CI config and
-  // hack markers are checked). "impl" = Phase I (full protection).
+  // "tests" = Phase T (the writer is SUPPOSED to create test files; test paths are open
+  // but CI/build-config/agent files and hack markers are still checked).
+  // "impl" = Phase I (full protection).
   phase: "tests" | "impl";
 }): ProtectViolation[] {
   const globs =
-    input.phase === "tests" ? CI_GLOBS : [...BUILTIN_PROTECT_GLOBS, ...EXTRA_PROTECT_GLOBS];
+    input.phase === "tests"
+      ? [...CI_GLOBS, ...BUILD_CONFIG_GLOBS, ...AGENT_GLOBS, ...EXTRA_PROTECT_GLOBS]
+      : [...BUILTIN_PROTECT_GLOBS, ...EXTRA_PROTECT_GLOBS];
   const violations: ProtectViolation[] = [];
 
   const frozen = new Set(input.frozenFiles.map((f) => f.replace(/\\/g, "/")));
@@ -117,11 +160,8 @@ export function violationReport(violations: ProtectViolation[]): string {
   return lines.join("\n");
 }
 
-// Test-path heuristic used by Phase T to freeze exactly what the test writer created.
+// Test-path heuristic (reporting only — the freeze set is everything Phase T committed,
+// because acceptance tests living at unconventional paths must be frozen too).
 export function looksLikeTestPath(file: string): boolean {
-  return matchesAny(file.replace(/\\/g, "/"), BUILTIN_PROTECT_GLOBS.slice(0, 8));
-}
-
-export function normalizeRel(repoRoot: string, p: string): string {
-  return path.relative(repoRoot, path.resolve(repoRoot, p)).replace(/\\/g, "/");
+  return matchesAny(file.replace(/\\/g, "/"), TEST_GLOBS);
 }

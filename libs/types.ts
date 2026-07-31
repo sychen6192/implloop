@@ -11,11 +11,17 @@ export interface GateResult {
   raw?: string;
 }
 
-// Agent-run output: final text plus tool-call observability.
+// Agent-run output. `status` separates infrastructure failures from bad answers:
+// "spawn-error" means the agent never ran — retrying or blaming the model is wrong there.
 // toolCallCount undefined = the runner cannot observe tool usage (must-read check disabled).
+// outputTokens undefined = the runner cannot observe token usage.
+export type AgentRunStatus = "ok" | "timeout" | "spawn-error";
+
 export interface AgentRunOutput {
   text: string;
+  status: AgentRunStatus;
   toolCallCount?: number;
+  outputTokens?: number;
 }
 
 // Runtime adapter: the interface that keeps the core free of SDK imports.
@@ -84,7 +90,10 @@ export type StopReason =
   | "review-rejected"
   | "blocked"
   | "needs-clarification"
-  | "plan-invalid";
+  | "plan-invalid"
+  // The agent process never started (missing CLI, bad IL_OPENCODE_BIN) — an environment
+  // failure, distinct from every model-behaviour stop above. Exit code 3.
+  | "runner-error";
 
 export interface OrchestratorResult {
   success: boolean;
@@ -93,6 +102,7 @@ export interface OrchestratorResult {
   stepsCompleted: number;
   stepsTotal: number;
   branch: string;
+  totalOutputTokens?: number;
   finalFeedback?: string;
   finalVerdict?: ReviewVerdict;
   blockedReason?: string;

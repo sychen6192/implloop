@@ -30,7 +30,7 @@ const EXIT_DRAIN_MS = 2_000;
 export function traceEvent(
   line: string,
   prefix: string,
-  acc: { text: string; lastText: string; toolCalls?: Set<string> },
+  acc: { text: string; lastText: string; toolCalls?: Set<string>; outputTokens?: number },
 ) {
   let ev: Record<string, unknown>;
   try {
@@ -48,8 +48,10 @@ export function traceEvent(
       break;
     case "step-finish": {
       const tokens = (part.tokens ?? {}) as Record<string, unknown>;
-      if (tokens.output !== undefined) {
-        logVerbose(`${prefix}  -- step 結束（output tokens=${String(tokens.output)}）`);
+      const out = Number(tokens.output);
+      if (Number.isFinite(out)) {
+        acc.outputTokens = (acc.outputTokens ?? 0) + out;
+        logVerbose(`${prefix}  -- step 結束（output tokens=${out}）`);
       }
       break;
     }
@@ -149,7 +151,7 @@ export class OpencodeRunner implements AgentRunner {
       if (plan.error) {
         log(`[FAIL] [${role}] ${plan.error}`);
         stopHeartbeat();
-        resolve({ text: "" });
+        resolve({ text: "", status: "spawn-error" });
         return;
       }
 
@@ -171,7 +173,12 @@ export class OpencodeRunner implements AgentRunner {
       child.stdin.on("error", () => {});
       child.stdin.end(prompt, "utf8");
 
-      const acc = { text: "", lastText: "", toolCalls: new Set<string>() };
+      const acc = {
+        text: "",
+        lastText: "",
+        toolCalls: new Set<string>(),
+        outputTokens: undefined as number | undefined,
+      };
       let rawStdout = "";
       let stdoutBuf = "";
 
@@ -193,8 +200,8 @@ export class OpencodeRunner implements AgentRunner {
         }
       });
 
-      // Timeout: kill the whole process tree. The old code signalled only the process we
-      // spawned, which on Windows is the cmd.exe wrapper rather than opencode itself.
+      // Timeout: kill the whole process tree — on Windows the direct child is a cmd.exe
+      // wrapper, and killing only it would leave opencode running (see libs/shell.ts).
       let timedOut = false;
       let killEscalation: ReturnType<typeof setTimeout> | undefined;
       const timer = setTimeout(() => {
@@ -226,7 +233,7 @@ export class OpencodeRunner implements AgentRunner {
         stopHeartbeat();
         if (spawnError) {
           log(`[FAIL] [${role}] ${spawnError}`);
-          resolve({ text: "" });
+          resolve({ text: "", status: "spawn-error" });
           return;
         }
         if (stdoutBuf.trim()) traceEvent(stdoutBuf, `[${role}]`, acc); // flush the partial line
@@ -238,14 +245,17 @@ export class OpencodeRunner implements AgentRunner {
             ? `[WARN] [${role}] 逾時中止（耗時 ${secs} 秒），以已收到的輸出繼續`
             : `[OK] [${role}] 完成（耗時 ${secs} 秒）`,
         );
+        const status = timedOut ? ("timeout" as const) : ("ok" as const);
         if (OPENCODE_JSON_EVENTS) {
           resolve({
             text: acc.text.trim() ? acc.text : acc.lastText,
+            status,
             toolCallCount: acc.toolCalls.size,
+            outputTokens: acc.outputTokens,
           });
         } else {
-          // non-JSONL fallback: whole stdout; tool usage unobservable (undefined), not zero
-          resolve({ text: rawStdout });
+          // non-JSONL fallback: whole stdout; tool/token usage unobservable (undefined)
+          resolve({ text: rawStdout, status });
         }
       };
 

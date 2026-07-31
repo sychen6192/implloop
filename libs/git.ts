@@ -6,7 +6,9 @@ import { REPO_ROOT } from "../config";
 
 export function git(args: string[], allowFail = false): string {
   try {
-    return execFileSync("git", args, {
+    // core.quotePath=false: porcelain output must carry non-ASCII paths verbatim, not
+    // C-quoted with octal escapes — the protect gate compares these paths literally.
+    return execFileSync("git", ["-c", "core.quotePath=false", ...args], {
       cwd: REPO_ROOT,
       encoding: "utf8",
       stdio: ["ignore", "pipe", "pipe"],

@@ -63,11 +63,8 @@ if (isToolItself) {
   add("FAIL", "git repo", "cwd 不是 git repo——implloop 需要 git 做 checkpoint/rollback");
 } else {
   add("OK", "git repo", gitlib.currentBranch());
-  add(
-    gitlib.isCleanTree() ? "OK" : "FAIL",
-    "clean working tree",
-    gitlib.isCleanTree() ? "" : "有未 commit 的改動——先 commit 或 stash",
-  );
+  const clean = gitlib.isCleanTree();
+  add(clean ? "OK" : "FAIL", "clean working tree", clean ? "" : "有未 commit 的改動——先 commit 或 stash");
 }
 
 // 5. build/test detection

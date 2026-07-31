@@ -16,6 +16,8 @@ import {
   RUNNER_KIND,
   ROLE_MODELS,
   BRANCH_PREFIX,
+  OPENCODE_JSON_EVENTS,
+  REVIEWER_MUST_READ,
 } from "./config";
 import { banner, log, die } from "./libs/log";
 import { assertAgents } from "./libs/guard";
@@ -27,16 +29,22 @@ import {
   currentBranch,
   headSha,
   createBranch,
+  resetHardClean,
   slugify,
   git,
 } from "./libs/git";
+import { onShutdown } from "./libs/shell";
 import { createRunner } from "./runners/runner";
 import { orchestrate } from "./orchestrator";
 import { OrchestratorResult } from "./libs/types";
 
+// 0 = success; 4 = the loop needs a human (clarification / spec conflict);
+// 3 = pipeline/environment failure (the agent CLI never ran); 2 = model failed the task;
+// 1 = die() fatal.
 function exitCodeFor(r: OrchestratorResult): number {
   if (r.success) return 0;
   if (r.stopReason === "needs-clarification" || r.stopReason === "blocked") return 4;
+  if (r.stopReason === "runner-error") return 3;
   return 2;
 }
 
@@ -66,6 +74,9 @@ async function main() {
     );
   }
   const baseBranch = currentBranch();
+  if (baseBranch === "HEAD") {
+    die("目前在 detached HEAD 上。implloop 結束時要能切回你的 branch，請先 checkout 一個 branch。");
+  }
   const baseSha = headSha();
 
   const buildCfg = detectBuildConfig();
@@ -91,13 +102,19 @@ async function main() {
   );
 
   if (RUNNER_KIND === "opencode") assertAgents(["planner", "writer", "reviewer"]);
+  if (!OPENCODE_JSON_EVENTS && REVIEWER_MUST_READ) {
+    log(
+      "[WARN] IL_OPENCODE_JSON=0 使 tool calls 無法觀測，reviewer 的 must-read 防護" +
+        "實質失效（無法分辨「未讀檔」與「無法觀測」）。",
+    );
+  }
 
   // Baseline: existing tests must be green, or every later gate result is meaningless.
   if (SKIP_BASELINE) {
     log("[WARN] 已跳過 baseline 測試（IL_SKIP_BASELINE=1）");
   } else {
     log("執行 baseline 測試（起點必須是綠的）…");
-    const baseline = runTestGate(buildCfg);
+    const baseline = await runTestGate(buildCfg);
     if (!baseline.passed) {
       die(
         "baseline 測試未通過。起點是紅的，之後所有 gate 都無法歸因。\n" +
@@ -113,9 +130,15 @@ async function main() {
   fs.mkdirSync(runDir, { recursive: true });
   fs.copyFileSync(taskPath, path.join(runDir, "task.md"));
 
-  const branch = `${BRANCH_PREFIX}${slugify(path.basename(taskPath))}-${runId.slice(0, 10)}`;
+  // Full runId (not just the date): two runs of the same task on the same day must not
+  // collide on the branch name.
+  const branch = `${BRANCH_PREFIX}${slugify(path.basename(taskPath))}-${runId}`;
   createBranch(branch);
   log(`已開 branch：${branch}`);
+
+  // A Ctrl-C mid-iteration must not leave half-written files on the branch; committed
+  // checkpoints survive, the dirty tail is rolled back (same as every other stop path).
+  const offShutdown = onShutdown(() => resetHardClean());
 
   fs.writeFileSync(
     path.join(runDir, "params.json"),
@@ -128,7 +151,15 @@ async function main() {
         buildCfg,
         limits: { MAX_SESSIONS, STEP_RETRIES, MAX_STEPS, STUCK_REPEATS },
         testFirst: TEST_FIRST,
+        skipReview: SKIP_REVIEW,
         runner: RUNNER_KIND,
+        // Resolved models per role — "" means the agent .md decides, which is otherwise
+        // invisible in the run record.
+        models: {
+          planner: ROLE_MODELS.planner || "(agent default)",
+          writer: ROLE_MODELS.writer || "(agent default)",
+          reviewer: ROLE_MODELS.reviewer || "(agent default)",
+        },
         toolVersion,
       },
       null,
@@ -138,10 +169,23 @@ async function main() {
   log(`artifacts：${runDir}`);
 
   const runner = await createRunner();
-  const result = await orchestrate({ task, runner, buildCfg, runDir, branch, baseSha });
+  let result: OrchestratorResult;
+  try {
+    result = await orchestrate({ task, runner, buildCfg, runDir, branch, baseSha });
+  } catch (e) {
+    // A crashed run must still leave a summary — otherwise the artifacts directory is
+    // indistinguishable from a run that is still going.
+    fs.writeFileSync(
+      path.join(runDir, "summary.json"),
+      JSON.stringify({ success: false, stopReason: "crash", error: String(e) }, null, 2),
+    );
+    throw e;
+  }
 
   banner("SUMMARY");
-  const reasonLabel: Record<string, string> = {
+  // Record<StopReason, string> (not Record<string, string>) so a new stop reason without
+  // a label is a compile error, not a raw identifier in the user's face.
+  const reasonLabel: Record<OrchestratorResult["stopReason"], string> = {
     "all-green": "全部關卡通過",
     stuck: "停損（同一失敗重複出現）",
     "session-budget": "session 預算用盡",
@@ -150,11 +194,15 @@ async function main() {
     blocked: "writer 回報 BLOCKED（規格/測試矛盾）",
     "needs-clarification": "規格不清，需要人類回答",
     "plan-invalid": "planner 產不出合法計畫",
+    "runner-error": "agent 程序起不來（環境問題，見 IL_OPENCODE_BIN）",
   };
   log(
-    `結果：${result.success ? "[OK]" : "[FAIL]"} ${reasonLabel[result.stopReason] ?? result.stopReason}` +
+    `結果：${result.success ? "[OK]" : "[FAIL]"} ${reasonLabel[result.stopReason]}` +
       `（steps ${result.stepsCompleted}/${result.stepsTotal}，sessions ${result.sessionsUsed}/${MAX_SESSIONS}）`,
   );
+  if (result.totalOutputTokens !== undefined) {
+    log(`output tokens 合計：${result.totalOutputTokens}`);
+  }
   if (result.clarifications?.length) {
     console.log("需要回答的問題：");
     result.clarifications.forEach((q, i) => console.log(`  ${i + 1}. ${q}`));
@@ -188,6 +236,7 @@ async function main() {
     JSON.stringify(result, (k, v) => (k === "raw" ? undefined : v), 2),
   );
   log(`artifacts 已寫入：${runDir}`);
+  offShutdown(); // normal exit: the tree is already committed or cleaned
   process.exit(exitCodeFor(result));
 }
 
